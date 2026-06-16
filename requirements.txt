@@ -1,0 +1,17 @@
+pandas
+numpy
+psycopg2-binary
+sentence-transformers
+huggingface-hub
+faiss-cpu
+torch
+python-dotenv
+unstructured
+python-docx
+openpyxl
+python-pptx
+pillow
+pymupdf
+pytesseract
+langdetect
+rarfile
