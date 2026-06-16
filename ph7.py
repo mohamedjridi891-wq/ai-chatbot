@@ -1,780 +1,668 @@
+# phase7.py
 """
-Phase 7: File Importance Scoring
-=================================
-Hybrid traditional + AI scoring pipeline that assigns every file an
-importance_score (0–100) and a label (KEEP / ARCHIVE / REVIEW / DELETE_CANDIDATE).
-
-Architecture mirrors Google Drive Gemini suggestions / Dropbox Dash Dash smart search.
+Phase 7 — File Importance Scoring (Dropbox Dash / Gemini-style)
+Nine signals with real AI reasoning (embeddings + LLM).
 """
 
-import os
+import argparse
 import json
-import time
 import logging
-import warnings
-import traceback
+import os
+import time
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 import psycopg2
-from psycopg2.extras import execute_values
+import requests
 from dotenv import load_dotenv
+from psycopg2.extras import execute_values, RealDictCursor
 from sklearn.cluster import DBSCAN
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import normalize
 import joblib
 
-warnings.filterwarnings("ignore")
 load_dotenv()
 
-# ─────────────────────────────────────────────
-# CONFIG (all overridable via .env)
-# ─────────────────────────────────────────────
-DB_URL               = os.getenv("DATABASE_URL", "postgresql://localhost/docdb")
-FAISS_PATH           = os.getenv("FAISS_PATH", "embeddings/chunk_embeddings.faiss")
-CHUNK_INDEX_PATH     = os.getenv("CHUNK_INDEX_PATH", "embeddings/chunk_index.json")
-MODEL_PATH           = os.getenv("MODEL_PATH", "phase7_rf_model.joblib")
-REPORT_PATH          = os.getenv("REPORT_PATH", "phase7_report.json")
-ERROR_LOG            = os.getenv("ERROR_LOG", "phase7_errors.log")
+# ========================= CONFIG =========================
+DB_URL = os.getenv("DB_URL")
+REPORT_PATH = os.getenv("PH7_REPORT_PATH", "phase7_report.json")
+MODEL_PATH = os.getenv("PH7_MODEL_PATH", "phase7_model.joblib")
+LLM_CACHE_PATH = Path("llm_cache.json")
 
-MAX_STALENESS_DAYS   = float(os.getenv("MAX_STALENESS_DAYS", "1825"))   # 5 years
-DBSCAN_EPS           = float(os.getenv("DBSCAN_EPS", "0.3"))
-DBSCAN_MIN_SAMPLES   = int(os.getenv("DBSCAN_MIN_SAMPLES", "3"))
-LLM_MAX_WORDS        = int(os.getenv("LLM_MAX_WORDS", "400"))
-LLM_BATCH_SIZE       = int(os.getenv("LLM_BATCH_SIZE", "100"))
-LLM_TIMEOUT          = float(os.getenv("LLM_TIMEOUT", "15"))
-KEEP_CENTROID_TOP_N  = int(os.getenv("KEEP_CENTROID_TOP_N", "200"))
-GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL           = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Bootstrap weights (S1–S8 only; S9 not yet available in boot phase)
-BOOT_WEIGHTS = np.array([0.10, 0.12, 0.10, 0.15, 0.08, 0.10, 0.18, 0.17], dtype=np.float32)
+DBSCAN_EPS = float(os.getenv("DBSCAN_EPS", 0.3))
+DBSCAN_MIN_SAMPLES = int(os.getenv("DBSCAN_MIN_SAMPLES", 3))
+LLM_MAX_WORDS = int(os.getenv("LLM_MAX_WORDS", 200))
+KEEP_CENTROID_N = int(os.getenv("KEEP_CENTROID_N", 200))
+MAX_STALENESS_DAYS = float(os.getenv("MAX_STALENESS_DAYS", 1825))
 
-# RF scoring weights (dot product with class midpoints)
-CLASS_MIDPOINTS = np.array([10, 35, 65, 90], dtype=np.float32)
-
-# Label thresholds (bootstrap)
-LABEL_THRESHOLDS = {"KEEP": 80, "ARCHIVE": 50, "REVIEW": 20}
-
-IDX_TO_LABEL = {0: "DELETE_CANDIDATE", 1: "REVIEW", 2: "ARCHIVE", 3: "KEEP"}
-LABEL_TO_IDX = {v: k for k, v in IDX_TO_LABEL.items()}
-
-# Extension weights
-EXT_WEIGHTS = {
-    "pdf": 1.0, "docx": 1.0, "doc": 1.0, "txt": 1.0,
-    "xlsx": 0.95, "xls": 0.95, "csv": 0.95,
-    "pptx": 0.85, "ppt": 0.85,
-    "py": 0.80, "js": 0.80, "ts": 0.80, "java": 0.80, "cpp": 0.80,
-    "c": 0.80, "go": 0.80, "rs": 0.80, "sql": 0.80, "sh": 0.80,
-    "json": 0.75, "xml": 0.75, "yaml": 0.75, "yml": 0.75,
-    "png": 0.50, "jpg": 0.50, "jpeg": 0.50, "gif": 0.50,
-    "zip": 0.40, "tar": 0.40, "gz": 0.40, "7z": 0.40,
-    "tmp": 0.00, "bak": 0.00, "log": 0.00,
+_BOOT_WEIGHTS = {
+    "s_content_richness": 0.20,
+    "s_recency": 0.10,
+    "s_type_importance": 0.15,
+    "s_uniqueness": 0.15,
+    "s_extraction_quality": 0.05,
+    "s_content_depth": 0.05,
+    "s_cluster_density": 0.15,
+    "s_llm_quality": 0.10,
+    "s_semantic_proximity": 0.05,
 }
 
+RF_PARAMS = {
+    "n_estimators": int(os.getenv("RF_N_ESTIMATORS", 300)),
+    "max_depth": int(os.getenv("RF_MAX_DEPTH", 15)) or None,
+    "min_samples_leaf": int(os.getenv("RF_MIN_SAMPLES_LEAF", 2)),
+    "class_weight": "balanced",
+    "random_state": 42,
+    "n_jobs": -1,
+}
 
-# ─────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────
+CLASS_MIDPOINTS = np.array([10.0, 35.0, 65.0, 90.0])
+
+IDX_TO_LABEL = {
+    0: "DELETE_CANDIDATE",
+    1: "REVIEW",
+    2: "ARCHIVE",
+    3: "KEEP",
+}
+
+SIGNAL_COLS = [
+    "s_content_richness",
+    "s_recency",
+    "s_type_importance",
+    "s_uniqueness",
+    "s_extraction_quality",
+    "s_content_depth",
+    "s_cluster_density",
+    "s_llm_quality",
+    "s_semantic_proximity",
+]
+
+# ========================= LOGGING =========================
 logging.basicConfig(
+    filename="phase7_errors.log",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(ERROR_LOG),
-        logging.StreamHandler(),
-    ],
+    format="%(asctime)s — %(levelname)s — %(message)s",
 )
-log = logging.getLogger("phase7")
+
+# ========================= HELPERS =========================
+def _conn():
+    if not DB_URL:
+        raise RuntimeError("DB_URL not set in .env")
+    return psycopg2.connect(DB_URL)
 
 
-def _safe(fn, default, label=""):
-    """Execute fn(); return default + log on any exception."""
-    try:
-        return fn()
-    except Exception as e:
-        log.warning(f"[SAFE:{label}] {e}")
-        return default
+def _create_tables(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS file_scores (
+                id SERIAL PRIMARY KEY,
+                file_id INTEGER UNIQUE REFERENCES files(id) ON DELETE CASCADE,
+                path TEXT,
+                name TEXT,
+                ext TEXT,
+                category TEXT,
+                s_content_richness REAL,
+                s_recency REAL,
+                s_type_importance REAL,
+                s_uniqueness REAL,
+                s_extraction_quality REAL,
+                s_content_depth REAL,
+                s_cluster_density REAL,
+                s_llm_quality REAL,
+                s_semantic_proximity REAL,
+                importance_score REAL,
+                label TEXT,
+                scored_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+
+    with conn.cursor() as cur:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fs_label ON file_scores(label)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fs_score ON file_scores(importance_score DESC)")
+        conn.commit()
 
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 1 & 2: DATA FETCH
-# ═══════════════════════════════════════════════════════════════
-
-def fetch_files(conn) -> pd.DataFrame:
-    """Fetch all files + extracted_content + aggregated chunk stats."""
-    log.info("► STEP 1: Fetching files from PostgreSQL…")
-    sql = """
-    SELECT
-        f.id                        AS file_id,
-        f.path,
-        f.name,
-        f.stem,
-        f.extension                 AS ext,
-        f.folder,
-        f.depth,
-        f.size_bytes,
-        f.created_time,
-        f.modified_time,
-        f.access_time,
-        f.hash,
-        COALESCE(ec.extraction_status, 'UNKNOWN')  AS extraction_status,
-        COALESCE(ec.ocr_applied, FALSE)             AS ocr_applied,
-        COALESCE(ec.word_count, 0)                  AS word_count,
-        COALESCE(ec.language_hint, '')              AS language_hint,
-        COALESCE(ch.chunk_total, 0)                 AS chunk_total,
-        COALESCE(ch.clean_chunks, 0)                AS clean_chunks
-    FROM files f
-    LEFT JOIN extracted_content ec ON ec.file_id = f.id
-    LEFT JOIN (
-        SELECT file_id,
-               MAX(chunk_total)                                    AS chunk_total,
-               COUNT(*) FILTER (WHERE clean_status = 'SUCCESS')   AS clean_chunks
-        FROM chunks
-        GROUP BY file_id
-    ) ch ON ch.file_id = f.id
-    ORDER BY f.id
-    """
-    df = pd.read_sql(sql, conn)
-    log.info(f"  Loaded {len(df):,} files.")
+def _fetch_all_data(conn) -> pd.DataFrame:
+    print(" [1/7] Fetching data from ph1–ph3 tables …")
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT 
+                f.id AS file_id,
+                f.path,
+                f.name,
+                f.stem,
+                f.extension,
+                f.folder,
+                f.depth,
+                f.size_bytes,
+                f.created_time,
+                f.modified_time,
+                f.access_time,
+                f.hash,
+                e.extraction_status,
+                e.ocr_applied,
+                e.word_count AS extracted_words,
+                e.language_hint,
+                ch.chunk_total,
+                ch.clean_word_count
+            FROM files f
+            LEFT JOIN extracted_content e ON f.id = e.file_id
+            LEFT JOIN (
+                SELECT 
+                    file_id, 
+                    MAX(chunk_total) AS chunk_total,
+                    SUM(clean_word_count) AS clean_word_count
+                FROM chunks 
+                WHERE clean_status = 'SUCCESS' 
+                GROUP BY file_id
+            ) ch ON f.id = ch.file_id
+        """)
+        rows = cur.fetchall()
+    if not rows:
+        raise RuntimeError("No files found — run phases 1-3 first.")
+    df = pd.DataFrame(rows)
+    print(f" → {len(df):,} files loaded")
     return df
 
 
-def fetch_duplicate_paths(conn) -> set:
-    """Return set of paths that are duplicates or redundant (Phase 6)."""
-    log.info("► STEP 2: Fetching duplicate/redundancy paths…")
-    dup_paths: set = set()
-
-    for table, cols in [
-        ("duplicate_files", ("path_1", "path_2")),
-        ("file_redundancy", ("path_1", "path_2")),
-    ]:
-        try:
-            cur = conn.cursor()
-            cur.execute(f"SELECT {cols[0]}, {cols[1]} FROM {table}")
-            for r in cur.fetchall():
-                dup_paths.update(r)
-            cur.close()
-            log.info(f"  {table}: +{len(dup_paths)} paths so far.")
-        except Exception as e:
-            log.warning(f"  Table {table} missing or error: {e}")
-            conn.rollback()
-
-    log.info(f"  Total duplicate paths: {len(dup_paths)}")
+def _fetch_duplicate_paths(conn) -> set:
+    print(" [2/7] Fetching duplicate/redundancy data …")
+    dup_paths = set()
+    with conn.cursor() as cur:
+        for query in [
+            "SELECT path_1 FROM duplicate_files UNION SELECT path_2 FROM duplicate_files",
+            "SELECT path_1 FROM file_redundancy WHERE action = 'DELETE duplicate' UNION SELECT path_2 FROM file_redundancy WHERE action = 'DELETE duplicate'",
+        ]:
+            try:
+                cur.execute(query)
+                for row in cur.fetchall():
+                    if row[0]:
+                        dup_paths.add(row[0])
+            except Exception:
+                conn.rollback()
+    print(f" → {len(dup_paths):,} duplicate/redundant paths")
     return dup_paths
 
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 3: FAISS EMBEDDINGS
-# ═══════════════════════════════════════════════════════════════
+def _fetch_embeddings(conn) -> dict:
+    print(" [3/7] Loading embeddings from FAISS …")
+    faiss_path = os.getenv("FAISS_PATH", "vector_store.faiss")
+    index_path = os.getenv("CHUNK_INDEX_PATH", "chunk_index.json")
 
-def load_embeddings(df: pd.DataFrame):
-    """
-    Returns embeddings dict {file_id: np.ndarray} by averaging chunk vectors.
-    Returns empty dict if FAISS unavailable.
-    """
-    log.info("► STEP 3: Loading FAISS embeddings…")
+    if not Path(faiss_path).exists() or not Path(index_path).exists():
+        print(" → FAISS files not found — S7/S9 will be 0")
+        return {}
+
     try:
-        import faiss  # type: ignore
+        import faiss
+        index = faiss.read_index(faiss_path)
+        with open(index_path, "r", encoding="utf-8") as f:
+            chunk_index = json.load(f)
 
-        index = faiss.read_index(FAISS_PATH)
+        n = index.ntotal
         dim = index.d
-        n_total = index.ntotal
+        print(f" → FAISS index: {n:,} vectors, dim={dim}")
 
-        with open(CHUNK_INDEX_PATH) as f:
-            raw_index = json.load(f)
+        all_vecs = np.zeros((n, dim), dtype=np.float32)
+        for i in range(n):
+            all_vecs[i] = index.reconstruct(i)
 
-        # Support both list-of-dicts and list-of-chunk_id-strings
-        if raw_index and isinstance(raw_index[0], dict):
-            chunk_meta = raw_index  # [{file_id, ...}, ...]
-        else:
-            # plain list of chunk_ids — build synthetic meta
-            chunk_meta = [{"chunk_id": i, "file_id": None} for i in raw_index]
+        file_vecs = defaultdict(list)
+        chunk_ids_to_resolve = []
 
-        if len(chunk_meta) != n_total:
-            log.warning(f"  chunk_index length {len(chunk_meta)} ≠ FAISS ntotal {n_total}; truncating.")
-            chunk_meta = chunk_meta[:n_total]
+        for i, entry in enumerate(chunk_index):
+            if i >= n:
+                break
+            if isinstance(entry, dict):
+                fid = entry.get("file_id") or entry.get("fileId")
+                if fid is not None:
+                    file_vecs[int(fid)].append(all_vecs[i])
+                    continue
+            # string chunk_id
+            chunk_id = entry if isinstance(entry, (str, int)) else None
+            if chunk_id:
+                chunk_ids_to_resolve.append((i, str(chunk_id)))
 
-        # Reconstruct all vectors
-        all_vecs = np.zeros((n_total, dim), dtype=np.float32)
-        index.reconstruct_n(0, n_total, all_vecs)
+        if chunk_ids_to_resolve:
+            ids = [cid for _, cid in chunk_ids_to_resolve]
+            with conn.cursor() as cur:
+                cur.execute("SELECT chunk_id, file_id FROM chunks WHERE chunk_id = ANY(%s)", (ids,))
+                mapping = {row[0]: row[1] for row in cur.fetchall()}
+            for i, chunk_id in chunk_ids_to_resolve:
+                fid = mapping.get(chunk_id)
+                if fid:
+                    file_vecs[int(fid)].append(all_vecs[i])
 
-        # Group by file_id
-        from collections import defaultdict
-        fid_vecs = defaultdict(list)
-        for i, meta in enumerate(chunk_meta):
-            fid = meta.get("file_id") if isinstance(meta, dict) else None
-            if fid is not None:
-                fid_vecs[int(fid)].append(all_vecs[i])
-
-        embeddings = {fid: np.mean(vecs, axis=0) for fid, vecs in fid_vecs.items()}
-        log.info(f"  Embeddings loaded for {len(embeddings):,} files. Dim={dim}.")
-        return embeddings
-
-    except ImportError:
-        log.warning("  faiss not installed — S7/S9 will be 0.")
-    except FileNotFoundError as e:
-        log.warning(f"  FAISS file missing: {e} — S7/S9 will be 0.")
+        emb_map = {
+            fid: np.mean(np.vstack(vecs), axis=0).astype(np.float32)
+            for fid, vecs in file_vecs.items() if len(vecs) > 0
+        }
+        print(f" → {len(emb_map):,} file embeddings created")
+        return emb_map
     except Exception as e:
-        log.warning(f"  Embedding load error: {e}")
+        logging.error(f"FAISS load failed: {e}")
+        print(f" → FAISS failed: {e} — S7/S9 = 0")
+        return {}
 
+
+def _fetch_top_chunks(conn, file_ids: list) -> dict:
+    if not file_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 
+                file_id,
+                array_to_string(array_agg(chunk_text ORDER BY chunk_index), ' ') AS chunk_text
+            FROM (
+                SELECT 
+                    file_id,
+                    clean_text AS chunk_text,
+                    chunk_index,
+                    ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY chunk_index ASC) AS rn
+                FROM chunks
+                WHERE file_id = ANY(%s)
+                  AND clean_status = 'SUCCESS'
+                  AND clean_text IS NOT NULL
+            ) t
+            WHERE rn <= 3
+            GROUP BY file_id
+        """, (file_ids,))
+        return {fid: text for fid, text in cur.fetchall()}
+
+
+# ========================= SIGNALS =========================
+def _s_content_richness(word_count) -> float:
+    if not word_count or word_count <= 0:
+        return 0.0
+    return float(min(np.log1p(word_count) / np.log1p(20_000), 1.0))
+
+
+def _s_recency(modified, accessed) -> float:
+    now = datetime.now(timezone.utc)
+    best = max((dt for dt in (modified, accessed) if dt), default=None)
+    if best is None:
+        return 0.0
+    if best.tzinfo is None:
+        best = best.replace(tzinfo=timezone.utc)
+    return float(1.0 - min((now - best).days / MAX_STALENESS_DAYS, 1.0))
+
+
+def _s_type_importance(ext: str) -> float:
+    e = (ext or "").lower().lstrip(".")
+    if e in {"pdf","docx","doc","odt","rtf","txt","md"}: return 1.00
+    if e in {"xlsx","xls","csv","ods"}: return 0.95
+    if e in {"pem","key","crt","p12","pfx"}: return 0.90
+    if e in {"pptx","ppt","odp"}: return 0.85
+    if e in {"py","js","ts","java","c","cpp","cs","go","rs","sql","sh"}: return 0.80
+    if e in {"json","xml","yaml","yml","toml"}: return 0.75
+    if e in {"jpg","jpeg","png","gif","bmp","svg","tiff"}: return 0.50
+    if e in {"zip","tar","gz","7z","rar"}: return 0.40
+    if e in {"tmp","temp","bak","log","cache"}: return 0.00
+    return 0.30
+
+
+def _s_uniqueness(path: str, dup_paths: set) -> float:
+    return 0.0 if path in dup_paths else 1.0
+
+
+def _s_extraction_quality(status, ocr) -> float:
+    s = (status or "").upper()
+    if s == "SUCCESS": return 1.0 if not ocr else 0.6
+    if s == "PARTIAL": return 0.3
+    return 0.0
+
+
+def _s_content_depth(chunk_total) -> float:
+    if not chunk_total or chunk_total <= 0:
+        return 0.0
+    return float(min(np.log1p(chunk_total) / np.log1p(20), 1.0))
+
+
+def _compute_traditional_signals(df: pd.DataFrame, dup_paths: set) -> pd.DataFrame:
+    print(" [4/7] Computing traditional signals S1–S6 …")
+    df["s_content_richness"] = df.apply(
+        lambda r: _s_content_richness(r.get("clean_word_count") or r.get("extracted_words") or 0), axis=1)
+    df["s_recency"] = df.apply(lambda r: _s_recency(r["modified_time"], r["access_time"]), axis=1)
+    df["s_type_importance"] = df["extension"].apply(_s_type_importance)
+    df["s_uniqueness"] = df["path"].apply(lambda p: _s_uniqueness(p, dup_paths))
+    df["s_extraction_quality"] = df.apply(
+        lambda r: _s_extraction_quality(r["extraction_status"], r["ocr_applied"]), axis=1)
+    df["s_content_depth"] = df["chunk_total"].apply(_s_content_depth)
+    return df
+
+
+def _compute_cluster_density(df: pd.DataFrame, emb_map: dict) -> pd.DataFrame:
+    print(" [5/7] Computing S7 — cluster density (DBSCAN) …")
+    has_emb = [fid for fid in df["file_id"] if fid in emb_map]
+    if not has_emb:
+        df["s_cluster_density"] = 0.0
+        return df
+
+    matrix = normalize(np.vstack([emb_map[fid] for fid in has_emb]))
+    labels = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES,
+                    metric="cosine", n_jobs=-1).fit_predict(matrix)
+
+    counts = Counter(labels)
+    max_size = max((v for k, v in counts.items() if k != -1), default=1)
+    density_map = {fid: (0.0 if lbl == -1 else counts[lbl] / max_size)
+                   for fid, lbl in zip(has_emb, labels)}
+
+    df["s_cluster_density"] = df["file_id"].map(density_map).fillna(0.0)
+    print(f" → {len(set(labels) - {-1})} clusters, {sum(1 for l in labels if l == -1)} noise")
+    return df
+
+
+# LLM
+_LLM_SYSTEM = """You are an enterprise data analyst. Rate the following document excerpt for business relevance and information density on a scale of 1 to 5:
+1 = useless (empty, gibberish, log noise, temp file)
+2 = low value (boilerplate, auto-generated, trivial)
+3 = moderate value (some useful info but generic)
+4 = high value (clear business content, decisions, data)
+5 = critical (contracts, financials, strategy, unique knowledge)
+Reply with a SINGLE integer 1-5. Nothing else."""
+
+
+def _load_llm_cache():
+    if LLM_CACHE_PATH.exists():
+        try:
+            return json.loads(LLM_CACHE_PATH.read_text(encoding="utf-8"))
+        except:
+            return {}
     return {}
 
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 4: SIGNALS S1–S6 (vectorized)
-# ═══════════════════════════════════════════════════════════════
-
-def compute_s1_to_s6(df: pd.DataFrame, dup_paths: set) -> pd.DataFrame:
-    """Compute signals S1–S6 as float32 columns on df."""
-    log.info("► STEP 4: Computing S1–S6…")
-    now = datetime.now(timezone.utc)
-
-    # S1 — content richness
-    df["s_content_richness"] = (
-        np.log1p(df["word_count"].fillna(0).clip(lower=0)) /
-        np.log1p(20_000)
-    ).clip(0, 1).astype(np.float32)
-
-    # S2 — recency
-    def best_ts(row):
-        candidates = []
-        for col in ("modified_time", "access_time"):
-            v = row.get(col)
-            if pd.notna(v):
-                ts = pd.Timestamp(v)
-                if ts.tzinfo is None:
-                    ts = ts.tz_localize("UTC")
-                candidates.append(ts)
-        return max(candidates) if candidates else None
-
-    df["_best_ts"] = df.apply(best_ts, axis=1)
-    df["_days_since"] = df["_best_ts"].apply(
-        lambda ts: (now - ts).days if ts else MAX_STALENESS_DAYS
-    )
-    df["s_recency"] = (
-        1 - (df["_days_since"] / MAX_STALENESS_DAYS)
-    ).clip(0, 1).astype(np.float32)
-
-    # S3 — type importance
-    df["s_type_importance"] = df["ext"].str.lower().map(
-        lambda e: EXT_WEIGHTS.get(str(e).lstrip("."), 0.30)
-    ).fillna(0.30).astype(np.float32)
-
-    # S4 — uniqueness
-    df["s_uniqueness"] = (~df["path"].isin(dup_paths)).astype(np.float32)
-
-    # S5 — extraction quality
-    status_map = {
-        "SUCCESS": 1.0, "CLEAN": 1.0,
-        "OCR": 0.6, "OCR_ASSISTED": 0.6,
-        "PARTIAL": 0.3,
-        "FAILED": 0.0, "ERROR": 0.0,
-    }
-    df["s_extraction_quality"] = df["extraction_status"].str.upper().map(
-        lambda s: status_map.get(s, 0.5)
-    ).fillna(0.5).astype(np.float32)
-
-    # S6 — content depth (successful clean chunks)
-    df["s_content_depth"] = (
-        np.log1p(df["clean_chunks"].fillna(0).clip(lower=0)) /
-        np.log1p(20)
-    ).clip(0, 1).astype(np.float32)
-
-    log.info("  S1–S6 computed.")
-    return df
+def _save_llm_cache(cache):
+    LLM_CACHE_PATH.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 5: S7 — DBSCAN CLUSTER DENSITY
-# ═══════════════════════════════════════════════════════════════
+def _call_groq_batch(texts: list[str]) -> list[float]:
+    if not GROQ_API_KEY:
+        return [0.5] * len(texts)
 
-def compute_s7_cluster_density(df: pd.DataFrame, embeddings: dict) -> pd.DataFrame:
-    """Compute S7 via DBSCAN on file embeddings."""
-    log.info("► STEP 5: Computing S7 (cluster density via DBSCAN)…")
+    cache = _load_llm_cache()
+    results = []
+    new_entries = {}
 
-    fids = df["file_id"].tolist()
-    vecs = [embeddings.get(fid) for fid in fids]
-    has_emb = [v is not None for v in vecs]
+    for text in texts:
+        key = hash(text[:800])
+        if key in cache:
+            results.append(cache[key])
+            continue
 
-    if sum(has_emb) < DBSCAN_MIN_SAMPLES:
-        log.warning("  Not enough embeddings for DBSCAN — S7=0.")
-        df["s_cluster_density"] = np.float32(0.0)
-        return df
-
-    emb_matrix = np.vstack([v for v in vecs if v is not None]).astype(np.float32)
-    emb_normed = normalize(emb_matrix, norm="l2")
-
-    db = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES, metric="cosine", n_jobs=-1)
-    labels = db.fit_predict(emb_normed)
-
-    from collections import Counter
-    label_counts = Counter(labels)
-    max_cluster = max((cnt for lbl, cnt in label_counts.items() if lbl != -1), default=1)
-
-    # Map back to all files
-    emb_idx = 0
-    s7_vals = []
-    for has in has_emb:
-        if has:
-            lbl = labels[emb_idx]
-            emb_idx += 1
-            if lbl == -1:
-                s7_vals.append(0.0)
-            else:
-                s7_vals.append(label_counts[lbl] / max_cluster)
-        else:
-            s7_vals.append(0.0)
-
-    df["s_cluster_density"] = np.array(s7_vals, dtype=np.float32)
-    unique_clusters = len(set(labels) - {-1})
-    noise_count = (labels == -1).sum()
-    log.info(f"  DBSCAN: {unique_clusters} clusters, {noise_count} noise points.")
-    return df
-
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 6: S8 — LLM QUALITY SCORING
-# ═══════════════════════════════════════════════════════════════
-
-def _heuristic_s8(row) -> float:
-    return float(0.3 * row["s_content_richness"] +
-                 0.4 * row["s_content_depth"] +
-                 0.3 * row["s_extraction_quality"])
-
-
-def _groq_rate_batch(texts: list[str]) -> list[float]:
-    """Call Groq API for a batch of texts; return list of [0,1] scores."""
-    try:
-        from groq import Groq  # type: ignore
-        client = Groq(api_key=GROQ_API_KEY)
-        scores = []
-        for text in texts:
-            truncated = " ".join(text.split()[:LLM_MAX_WORDS])
-            prompt = (
-                "Rate the business relevance of this document excerpt on a scale "
-                "from 1 (irrelevant/noise) to 5 (critical business document). "
-                "Reply with ONLY the integer rating.\n\n"
-                f"EXCERPT:\n{truncated}"
-            )
-            try:
-                resp = client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=5,
-                    timeout=LLM_TIMEOUT,
-                )
-                rating_str = resp.choices[0].message.content.strip()
-                rating = int("".join(c for c in rating_str if c.isdigit())[:1] or "3")
-                rating = max(1, min(5, rating))
-                scores.append((rating - 1) / 4)
-            except Exception as e:
-                log.warning(f"  Groq per-item error: {e}")
-                scores.append(0.5)
-        return scores
-    except ImportError:
-        log.warning("  groq package not installed.")
-        raise
-    except Exception as e:
-        log.warning(f"  Groq batch error: {e}")
-        raise
-
-
-def compute_s8_llm_quality(df: pd.DataFrame, conn, dup_paths: set) -> pd.DataFrame:
-    """Compute S8 — Groq LLM business relevance or heuristic fallback."""
-    log.info("► STEP 6: Computing S8 (LLM quality)…")
-
-    use_llm = bool(GROQ_API_KEY)
-    if not use_llm:
-        log.info("  No GROQ_API_KEY — using heuristic fallback for S8.")
-        df["s_llm_quality"] = df.apply(_heuristic_s8, axis=1).astype(np.float32)
-        return df
-
-    # Build candidate map: file_id → first chunk text
-    log.info("  Fetching representative chunk texts…")
-    try:
-        eligible_fids = df.loc[
-            (~df["path"].isin(dup_paths)) & (df["word_count"] > 20), "file_id"
-        ].tolist()
-
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT ON (file_id) file_id, chunk_text
-            FROM chunks
-            WHERE file_id = ANY(%s) AND clean_status = 'SUCCESS'
-            ORDER BY file_id, chunk_index
-        """, (eligible_fids,))
-        rows = cur.fetchall()
-        cur.close()
-        fid_to_text = {r[0]: r[1] for r in rows}
-        log.info(f"  Got chunk texts for {len(fid_to_text):,} files.")
-    except Exception as e:
-        log.warning(f"  Could not fetch chunk texts: {e}; using heuristic.")
-        conn.rollback()
-        df["s_llm_quality"] = df.apply(_heuristic_s8, axis=1).astype(np.float32)
-        return df
-
-    # Batch LLM calls
-    s8_map: dict = {}
-    fids_to_score = [fid for fid in eligible_fids if fid in fid_to_text]
-    for i in range(0, len(fids_to_score), LLM_BATCH_SIZE):
-        batch_fids = fids_to_score[i:i + LLM_BATCH_SIZE]
-        batch_texts = [fid_to_text[fid] for fid in batch_fids]
-        pct = 100 * (i + len(batch_fids)) / max(len(fids_to_score), 1)
-        log.info(f"  LLM batch {i // LLM_BATCH_SIZE + 1}: {len(batch_fids)} files [{pct:.0f}%]")
+        snippet = " ".join(text.split()[:LLM_MAX_WORDS])
         try:
-            scores = _groq_rate_batch(batch_texts)
-        except Exception:
-            scores = [0.5] * len(batch_fids)
-        for fid, sc in zip(batch_fids, scores):
-            s8_map[fid] = sc
+            resp = requests.post(
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": _LLM_SYSTEM},
+                        {"role": "user", "content": snippet}
+                    ],
+                    "max_tokens": 5,
+                    "temperature": 0.0,
+                },
+                timeout=18,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            score = int("".join(c for c in raw if c.isdigit())[:1] or 3)
+            norm_score = float(max(1, min(score, 5)) - 1) / 4.0
+            results.append(norm_score)
+            new_entries[key] = norm_score
+        except Exception as e:
+            logging.warning(f"Groq error: {e}")
+            results.append(0.5)
+            new_entries[key] = 0.5
 
-    def get_s8(row):
-        if row["file_id"] in s8_map:
-            return s8_map[row["file_id"]]
-        return _heuristic_s8(row)
+    cache.update(new_entries)
+    _save_llm_cache(cache)
+    return results
 
-    df["s_llm_quality"] = df.apply(get_s8, axis=1).astype(np.float32)
-    log.info("  S8 complete.")
+
+def _compute_llm_quality(df: pd.DataFrame, dup_paths: set, conn) -> pd.DataFrame:
+    print(" [6/7] Computing S8 — LLM quality …")
+    if not GROQ_API_KEY:
+        print("   → No GROQ key, using heuristic fallback")
+        df["s_llm_quality"] = (0.3 * df["s_content_richness"] +
+                               0.4 * df["s_content_depth"] +
+                               0.3 * df["s_extraction_quality"]).clip(0.0, 1.0).fillna(0.2)
+        return df
+
+    candidates = df[(~df["path"].isin(dup_paths)) & (df["extracted_words"].fillna(0) > 20)]["file_id"].tolist()
+    print(f"   → Scoring {len(candidates):,} files via Groq (batched)")
+
+    chunk_map = _fetch_top_chunks(conn, candidates)
+    texts = [chunk_map.get(fid, "") for fid in candidates]
+
+    scores_list = _call_groq_batch(texts)
+    score_map = dict(zip(candidates, scores_list))
+
+    df["s_llm_quality"] = df["file_id"].map(score_map).fillna(0.2)
     return df
 
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 7: S9 — SEMANTIC PROXIMITY TO KEEP CENTROID
-# ═══════════════════════════════════════════════════════════════
-
-def compute_s9_semantic_proximity(df: pd.DataFrame, embeddings: dict) -> pd.DataFrame:
-    """Compute S9 — cosine similarity to centroid of top-N KEEP bootstrap files."""
-    log.info("► STEP 7: Computing S9 (semantic proximity)…")
-
-    if not embeddings:
-        log.warning("  No embeddings — S9=0.")
-        df["s_semantic_proximity"] = np.float32(0.0)
+def _compute_semantic_proximity(df: pd.DataFrame, emb_map: dict) -> pd.DataFrame:
+    print(" [7/7] Computing S9 — semantic proximity to KEEP centroid …")
+    if not emb_map:
+        df["s_semantic_proximity"] = 0.0
         return df
 
-    # Bootstrap: weighted sum S1–S8
-    sig_cols = ["s_content_richness", "s_recency", "s_type_importance",
-                "s_uniqueness", "s_extraction_quality", "s_content_depth",
-                "s_cluster_density", "s_llm_quality"]
-    sig_matrix = df[sig_cols].fillna(0).values.astype(np.float32)
-    boot_scores = sig_matrix @ BOOT_WEIGHTS  # shape (N,)
+    boot = sum(_BOOT_WEIGHTS[s] * df[s] for s in SIGNAL_COLS if s != "s_semantic_proximity")
+    df["_boot"] = boot
 
-    top_n_idx = np.argsort(boot_scores)[::-1][:KEEP_CENTROID_TOP_N]
-    top_fids = df["file_id"].iloc[top_n_idx].tolist()
+    top_ids = (df[df["file_id"].isin(emb_map)]
+               .nlargest(KEEP_CENTROID_N, "_boot")["file_id"]
+               .tolist())
 
-    keep_vecs = [embeddings[fid] for fid in top_fids if fid in embeddings]
-    if not keep_vecs:
-        log.warning("  No embedding vectors for top KEEP files — S9=0.")
-        df["s_semantic_proximity"] = np.float32(0.0)
+    if not top_ids:
+        df["s_semantic_proximity"] = 0.0
+        df.drop(columns=["_boot"], errors='ignore', inplace=True)
         return df
 
-    centroid = np.mean(keep_vecs, axis=0).astype(np.float32)
-    centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-9)
+    centroid = normalize(np.mean(np.vstack([emb_map[fid] for fid in top_ids]), axis=0, keepdims=True))
+    has_emb = [fid for fid in df["file_id"] if fid in emb_map]
+    matrix = normalize(np.vstack([emb_map[fid] for fid in has_emb]))
 
-    def cosine_to_centroid(fid):
-        v = embeddings.get(fid)
-        if v is None:
-            return 0.5  # neutral
-        vn = v / (np.linalg.norm(v) + 1e-9)
-        cos = float(np.dot(vn, centroid_norm))
-        return (cos + 1) / 2  # rescale [-1,1] → [0,1]
+    sims = cosine_similarity(matrix, centroid).flatten()
+    sim_map = dict(zip(has_emb, sims.tolist()))
 
-    df["s_semantic_proximity"] = df["file_id"].map(cosine_to_centroid).astype(np.float32)
-    log.info(f"  S9 computed. Centroid built from {len(keep_vecs)} vectors.")
+    df["s_semantic_proximity"] = df["file_id"].map(sim_map).fillna(0.0).clip(-1, 1).add(1).div(2)
+    df.drop(columns=["_boot"], errors='ignore', inplace=True)
+    print(f"   → Centroid from top {len(top_ids)} files")
     return df
 
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 8: RF CLASSIFIER → IMPORTANCE SCORE + LABEL
-# ═══════════════════════════════════════════════════════════════
-
-ALL_SIGNAL_COLS = [
-    "s_content_richness", "s_recency", "s_type_importance",
-    "s_uniqueness", "s_extraction_quality", "s_content_depth",
-    "s_cluster_density", "s_llm_quality", "s_semantic_proximity",
-]
-BOOT_WEIGHTS_9 = np.append(BOOT_WEIGHTS, 0.0).astype(np.float32)  # S9 has 0 in boot phase
-
-
-def _label_to_idx(score: float) -> int:
-    if score >= LABEL_THRESHOLDS["KEEP"]:
-        return LABEL_TO_IDX["KEEP"]
-    elif score >= LABEL_THRESHOLDS["ARCHIVE"]:
-        return LABEL_TO_IDX["ARCHIVE"]
-    elif score >= LABEL_THRESHOLDS["REVIEW"]:
-        return LABEL_TO_IDX["REVIEW"]
-    else:
-        return LABEL_TO_IDX["DELETE_CANDIDATE"]
+# ========================= RF =========================
+def _bootstrap_labels(df: pd.DataFrame) -> np.ndarray:
+    raw = sum(_BOOT_WEIGHTS[s] * df[s] for s in SIGNAL_COLS) * 100
+    lo, hi = raw.min(), raw.max()
+    if hi > lo:
+        raw = (raw - lo) / (hi - lo) * 100
+    return np.where(raw >= 80, 3,
+                    np.where(raw >= 50, 2,
+                             np.where(raw >= 20, 1, 0)))
 
 
-def train_or_load_rf(df: pd.DataFrame) -> RandomForestClassifier:
+def _get_model(df: pd.DataFrame, X: np.ndarray) -> RandomForestClassifier:
     if Path(MODEL_PATH).exists():
-        log.info(f"  Loading saved RF model from {MODEL_PATH}…")
+        print(f" Loading existing model from {MODEL_PATH}")
         return joblib.load(MODEL_PATH)
 
-    log.info("  Training RandomForest (bootstrap labels)…")
-    X = df[ALL_SIGNAL_COLS].fillna(0).values.astype(np.float32)
-
-    # Boot score using BOOT_WEIGHTS_9
-    boot_scores = X @ BOOT_WEIGHTS_9 * 100  # scale to 0–100
-    y = np.array([_label_to_idx(s) for s in boot_scores])
-
-    clf = RandomForestClassifier(
-        n_estimators=300,
-        class_weight="balanced",
-        n_jobs=-1,
-        random_state=42,
-    )
-    clf.fit(X, y)
-    joblib.dump(clf, MODEL_PATH)
-    log.info(f"  RF trained & saved → {MODEL_PATH}")
-    return clf
+    print(" Training new Random Forest (bootstrapped labels)…")
+    y = _bootstrap_labels(df)
+    rf = RandomForestClassifier(**RF_PARAMS)
+    if len(X) >= 10:
+        cv = cross_val_score(rf, X, y, cv=min(5, len(X)//2), scoring="accuracy")
+        print(f" Cross-val accuracy: {cv.mean():.3f} ± {cv.std():.3f}")
+    rf.fit(X, y)
+    joblib.dump(rf, MODEL_PATH)
+    print(f" Model saved → {MODEL_PATH}")
+    return rf
 
 
-def score_with_rf(clf: RandomForestClassifier, df: pd.DataFrame) -> pd.DataFrame:
-    """Apply RF → importance_score + label."""
-    log.info("► STEP 8: Scoring with RF classifier…")
-    X = df[ALL_SIGNAL_COLS].fillna(0).values.astype(np.float32)
-    proba = clf.predict_proba(X).astype(np.float32)
-
-    # Ensure columns match IDX_TO_LABEL ordering
-    class_order = clf.classes_
-    full_proba = np.zeros((len(df), 4), dtype=np.float32)
-    for col_i, cls_idx in enumerate(class_order):
-        full_proba[:, cls_idx] = proba[:, col_i]
-
-    importance_scores = (full_proba @ CLASS_MIDPOINTS).clip(0, 100)
-    label_indices = full_proba.argmax(axis=1)
-    labels = [IDX_TO_LABEL[i] for i in label_indices]
-
-    df["importance_score"] = importance_scores.astype(np.float32)
-    df["label"] = labels
-    log.info("  Scoring complete.")
-    return df
+def _rf_score(rf, X):
+    proba = rf.predict_proba(X)
+    scores = np.clip(proba.dot(CLASS_MIDPOINTS), 0, 100).round(2)
+    labels = np.array([IDX_TO_LABEL[i] for i in np.argmax(proba, axis=1)])
+    return scores, labels
 
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 9: UPSERT TO file_scores
-# ═══════════════════════════════════════════════════════════════
+def _save_to_db(conn, df: pd.DataFrame):
+    print(" Saving scores to database …")
+    rows = [
+        (
+            int(r.file_id), r.path, r.name, r.extension, None,
+            float(r.s_content_richness), float(r.s_recency),
+            float(r.s_type_importance), float(r.s_uniqueness),
+            float(r.s_extraction_quality), float(r.s_content_depth),
+            float(r.s_cluster_density), float(r.s_llm_quality),
+            float(r.s_semantic_proximity),
+            float(r.importance_score), r.label
+        )
+        for r in df.itertuples(index=False)
+    ]
 
-CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS file_scores (
-    file_id              BIGINT PRIMARY KEY,
-    path                 TEXT,
-    name                 TEXT,
-    ext                  TEXT,
-    category             TEXT,
-    s_content_richness   REAL,
-    s_recency            REAL,
-    s_type_importance    REAL,
-    s_uniqueness         REAL,
-    s_extraction_quality REAL,
-    s_content_depth      REAL,
-    s_cluster_density    REAL,
-    s_llm_quality        REAL,
-    s_semantic_proximity REAL,
-    importance_score     REAL,
-    label                TEXT,
-    scored_at            TIMESTAMPTZ DEFAULT NOW()
-);
-"""
-
-UPSERT_SQL = """
-INSERT INTO file_scores (
-    file_id, path, name, ext, category,
-    s_content_richness, s_recency, s_type_importance,
-    s_uniqueness, s_extraction_quality, s_content_depth,
-    s_cluster_density, s_llm_quality, s_semantic_proximity,
-    importance_score, label, scored_at
-) VALUES %s
-ON CONFLICT (file_id) DO UPDATE SET
-    path                 = EXCLUDED.path,
-    name                 = EXCLUDED.name,
-    ext                  = EXCLUDED.ext,
-    category             = EXCLUDED.category,
-    s_content_richness   = EXCLUDED.s_content_richness,
-    s_recency            = EXCLUDED.s_recency,
-    s_type_importance    = EXCLUDED.s_type_importance,
-    s_uniqueness         = EXCLUDED.s_uniqueness,
-    s_extraction_quality = EXCLUDED.s_extraction_quality,
-    s_content_depth      = EXCLUDED.s_content_depth,
-    s_cluster_density    = EXCLUDED.s_cluster_density,
-    s_llm_quality        = EXCLUDED.s_llm_quality,
-    s_semantic_proximity = EXCLUDED.s_semantic_proximity,
-    importance_score     = EXCLUDED.importance_score,
-    label                = EXCLUDED.label,
-    scored_at            = EXCLUDED.scored_at
-"""
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO file_scores (
+                file_id, path, name, ext, category,
+                s_content_richness, s_recency, s_type_importance, s_uniqueness,
+                s_extraction_quality, s_content_depth, s_cluster_density,
+                s_llm_quality, s_semantic_proximity,
+                importance_score, label
+            ) VALUES %s
+            ON CONFLICT (file_id) DO UPDATE SET
+                s_content_richness = EXCLUDED.s_content_richness,
+                s_recency = EXCLUDED.s_recency,
+                s_type_importance = EXCLUDED.s_type_importance,
+                s_uniqueness = EXCLUDED.s_uniqueness,
+                s_extraction_quality = EXCLUDED.s_extraction_quality,
+                s_content_depth = EXCLUDED.s_content_depth,
+                s_cluster_density = EXCLUDED.s_cluster_density,
+                s_llm_quality = EXCLUDED.s_llm_quality,
+                s_semantic_proximity = EXCLUDED.s_semantic_proximity,
+                importance_score = EXCLUDED.importance_score,
+                label = EXCLUDED.label,
+                scored_at = NOW()
+        """, rows)
+        conn.commit()
+    print(f" → {len(rows):,} files scored")
 
 
-def upsert_scores(conn, df: pd.DataFrame) -> None:
-    log.info("► STEP 9: Upserting scores to file_scores…")
-    now_str = datetime.now(timezone.utc).isoformat()
-    cur = conn.cursor()
-    cur.execute(CREATE_TABLE_SQL)
-
-    rows = []
-    for _, row in df.iterrows():
-        rows.append((
-            int(row["file_id"]),
-            str(row.get("path", "")),
-            str(row.get("name", "")),
-            str(row.get("ext", "")),
-            str(row.get("folder", "")),  # category ← folder
-            float(row["s_content_richness"]),
-            float(row["s_recency"]),
-            float(row["s_type_importance"]),
-            float(row["s_uniqueness"]),
-            float(row["s_extraction_quality"]),
-            float(row["s_content_depth"]),
-            float(row["s_cluster_density"]),
-            float(row["s_llm_quality"]),
-            float(row["s_semantic_proximity"]),
-            float(row["importance_score"]),
-            str(row["label"]),
-            now_str,
-        ))
-
-    execute_values(cur, UPSERT_SQL, rows, page_size=500)
-    conn.commit()
-    cur.close()
-    log.info(f"  Upserted {len(rows):,} rows into file_scores.")
-
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 10: JSON REPORT
-# ═══════════════════════════════════════════════════════════════
-
-def write_report(df: pd.DataFrame, clf: RandomForestClassifier, elapsed: float) -> None:
-    log.info("► STEP 10: Writing JSON report…")
-    scores = df["importance_score"]
-
-    label_counts = df["label"].value_counts().to_dict()
-    total = len(df)
-    label_pcts = {k: round(100 * v / total, 2) for k, v in label_counts.items()}
-
-    top10 = (
-        df.nlargest(10, "importance_score")[["file_id", "path", "importance_score", "label"]]
-        .to_dict(orient="records")
-    )
-    bottom10 = (
-        df.nsmallest(10, "importance_score")[["file_id", "path", "importance_score", "label"]]
-        .to_dict(orient="records")
-    )
-
-    fi = dict(zip(ALL_SIGNAL_COLS, clf.feature_importances_.tolist()))
-
-    report = {
+def _build_report(df: pd.DataFrame, rf, elapsed: float) -> dict:
+    fi = dict(zip(SIGNAL_COLS, rf.feature_importances_.tolist()))
+    return {
         "phase": 7,
-        "scored_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 2),
-        "total_files": total,
-        "score_distribution": {
-            "min": round(float(scores.min()), 2),
-            "max": round(float(scores.max()), 2),
-            "mean": round(float(scores.mean()), 2),
-            "median": round(float(scores.median()), 2),
-            "p25": round(float(scores.quantile(0.25)), 2),
-            "p75": round(float(scores.quantile(0.75)), 2),
+        "total_files_scored": len(df),
+        "model": {
+            "type": "RandomForestClassifier",
+            "n_estimators": rf.n_estimators,
+            "max_depth": rf.max_depth,
+            "model_path": MODEL_PATH,
+            "feature_importance": {k: round(v, 4) for k, v in fi.items()},
         },
-        "label_counts": label_counts,
-        "label_percentages": label_pcts,
-        "rf_feature_importances": fi,
-        "top_10_files": top10,
-        "bottom_10_files": bottom10,
+        "score_distribution": {
+            "mean": round(float(df["importance_score"].mean()), 2),
+            "median": round(float(df["importance_score"].median()), 2),
+            "std": round(float(df["importance_score"].std()), 2),
+            "min": round(float(df["importance_score"].min()), 2),
+            "max": round(float(df["importance_score"].max()), 2),
+        },
+        "label_counts": df["label"].value_counts().to_dict(),
+        "top_10_files": df.nlargest(10, "importance_score")[[
+            "name", "extension", "importance_score", "label",
+            "s_llm_quality", "s_cluster_density", "s_semantic_proximity"
+        ]].to_dict(orient="records"),
+        "bottom_10_files": df.nsmallest(10, "importance_score")[[
+            "name", "extension", "importance_score", "label",
+            "s_llm_quality", "s_cluster_density", "s_semantic_proximity"
+        ]].to_dict(orient="records"),
     }
 
-    with open(REPORT_PATH, "w") as f:
+
+# ========================= MAIN =========================
+def run_phase7(max_files: int = None, dry_run: bool = False, force_retrain: bool = False):
+    t0 = time.time()
+    print("\n" + "="*70)
+    print("Phase 7 — File Importance Scoring (Dash / Gemini-style)")
+    print("="*70 + "\n")
+
+    conn = _conn()
+    _create_tables(conn)
+
+    df = _fetch_all_data(conn)
+    if max_files:
+        df = df.head(max_files)
+
+    dup_paths = _fetch_duplicate_paths(conn)
+    emb_map = _fetch_embeddings(conn)
+
+    df = _compute_traditional_signals(df, dup_paths)
+    df = _compute_cluster_density(df, emb_map)
+    df = _compute_llm_quality(df, dup_paths, conn)
+    df = _compute_semantic_proximity(df, emb_map)
+
+    X = df[SIGNAL_COLS].values.astype(np.float32)
+
+    if force_retrain and Path(MODEL_PATH).exists():
+        Path(MODEL_PATH).unlink()
+
+    rf = _get_model(df, X)
+
+    print(" Scoring with Random Forest …")
+    scores, labels = _rf_score(rf, X)
+    df["importance_score"] = scores
+    df["label"] = labels
+
+    if not dry_run:
+        _save_to_db(conn, df)
+
+    conn.close()
+
+    elapsed = time.time() - t0
+    report = _build_report(df, rf, elapsed)
+
+    with open(REPORT_PATH, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str)
-    log.info(f"  Report written → {REPORT_PATH}")
+
+    # Pretty print summary
+    print(f"\n{'='*70}")
+    print(f"Files scored     : {report['total_files_scored']:,}")
+    sd = report["score_distribution"]
+    print(f"Score mean/median: {sd['mean']:.1f} / {sd['median']:.1f}")
+    print(f"Label distribution:")
+    for label, count in sorted(report["label_counts"].items(), key=lambda x: -x[1]):
+        pct = count / report["total_files_scored"] * 100
+        print(f"  {label:<18} {count:6,} ({pct:5.1f}%)")
+    print(f"\nTop file : {report['top_10_files'][0]['name'] if report['top_10_files'] else 'N/A'}")
+    print(f"Report   : {REPORT_PATH}")
+    print(f"Elapsed  : {elapsed:.1f}s")
+    print("="*70)
     return report
 
 
-def print_summary(df: pd.DataFrame, clf: RandomForestClassifier, elapsed: float) -> None:
-    total = len(df)
-    scores = df["importance_score"]
-    label_counts = df["label"].value_counts()
-
-    print("\n" + "═" * 60)
-    print("  PHASE 7 COMPLETE — FILE IMPORTANCE SCORING")
-    print("═" * 60)
-    print(f"  Total files scored : {total:,}")
-    print(f"  Elapsed time       : {elapsed:.1f}s")
-    print(f"\n  Score Distribution:")
-    print(f"    Min    : {scores.min():.1f}")
-    print(f"    Mean   : {scores.mean():.1f}")
-    print(f"    Median : {scores.median():.1f}")
-    print(f"    Max    : {scores.max():.1f}")
-
-    print(f"\n  Label Breakdown:")
-    for label, count in label_counts.items():
-        pct = 100 * count / total
-        bar = "█" * int(pct / 2)
-        print(f"    {label:<20} {count:>6,}  ({pct:5.1f}%)  {bar}")
-
-    print(f"\n  RF Feature Importances:")
-    fi = list(zip(ALL_SIGNAL_COLS, clf.feature_importances_))
-    fi.sort(key=lambda x: -x[1])
-    for name, importance in fi:
-        bar = "▓" * int(importance * 40)
-        print(f"    {name:<25} {importance:.4f}  {bar}")
-
-    print("═" * 60 + "\n")
-
-
-# ═══════════════════════════════════════════════════════════════
-# MAIN PIPELINE
-# ═══════════════════════════════════════════════════════════════
-
-def run_pipeline():
-    t0 = time.time()
-    log.info("═" * 60)
-    log.info("PHASE 7: FILE IMPORTANCE SCORING — STARTING")
-    log.info("═" * 60)
-
-    conn = psycopg2.connect(DB_URL)
-
-    try:
-        # Steps 1–2: data fetch
-        df = fetch_files(conn)
-        dup_paths = fetch_duplicate_paths(conn)
-
-        # Step 3: embeddings
-        embeddings = load_embeddings(df)
-
-        # Steps 4–6: traditional signals
-        df = compute_s1_to_s6(df, dup_paths)
-        df = compute_s7_cluster_density(df, embeddings)
-        df = compute_s8_llm_quality(df, conn, dup_paths)
-
-        # Step 7: semantic proximity
-        df = compute_s9_semantic_proximity(df, embeddings)
-
-        # Clamp all signal columns
-        for col in ALL_SIGNAL_COLS:
-            df[col] = df[col].fillna(0).clip(0, 1).astype(np.float32)
-
-        # Step 8: RF scoring
-        clf = train_or_load_rf(df)
-        df = score_with_rf(clf, df)
-
-        # Step 9: persist
-        upsert_scores(conn, df)
-
-        # Step 10: report
-        elapsed = time.time() - t0
-        report = write_report(df, clf, elapsed)
-        print_summary(df, clf, elapsed)
-
-    except Exception:
-        log.error("FATAL: " + traceback.format_exc())
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
 if __name__ == "__main__":
-    run_pipeline()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-files", type=int, help="Limit number of files for testing")
+    parser.add_argument("--dry-run", action="store_true", help="Don't write to DB")
+    parser.add_argument("--force-retrain", action="store_true", help="Ignore saved model")
+    args = parser.parse_args()
+
+    run_phase7(
+        max_files=args.max_files,
+        dry_run=args.dry_run,
+        force_retrain=args.force_retrain
+    )
